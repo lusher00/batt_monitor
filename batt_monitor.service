@@ -1,0 +1,14 @@
+[Unit]
+Description=Battery voltage monitor (continuous watch)
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/batt_monitor --watch
+Restart=on-failure
+RestartSec=10
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

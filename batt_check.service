@@ -1,0 +1,16 @@
+[Unit]
+Description=Battery voltage boot check (abort boot if critical)
+# Run as early as possible — before network, before balance_bot
+DefaultDependencies=no
+After=local-fs.target
+Before=network.target sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/batt_monitor --check
+# If batt_monitor returns 1 (critical) systemd will log the failure;
+# the program itself calls shutdown -h now so the system goes down anyway.
+RemainAfterExit=no
+
+[Install]
+WantedBy=sysinit.target
