@@ -1,29 +1,37 @@
 /**
  * batt_monitor.c
  *
- * Reads 3S LiPo voltage via a resistor divider on AIN0.
- * Divider: 10k (top) + 68k (bottom) → Vbat/7.8 on AIN0.
+ * Reads LiPo voltage via a resistor divider on AIN1.
+ * Divider: 68k (top) + 10k (bottom) → Vbat/7.8 on AIN1.
  * ADC ref = 1.8V, 12-bit (0–4095).
  *
  * Modes:
- *   --check   single shot, exits 0 if OK, 1 if critical (for boot oneshot)
- *   --watch   loop every 60s, logs + shuts down at critical (for service)
+ *   --check     single shot, logs voltage + status, exits 0 always
+ *   --watch     loop (default 60s), logs warnings
+ *   --print     print raw voltage to stdout as "12.34" and exit (scripting)
  *
- * Thresholds (3S LiPo):
- *   WARNING  : 10.5V  (3.50V/cell)
- *   CRITICAL : 9.6V   (3.20V/cell) → graceful shutdown
+ * Threshold flags (volts):
+ *   --warning V     default 10.5  (3.50V/cell × 3S)
+ *   --low V         default  9.9  (3.30V/cell × 3S)
+ *   --critical V    default  9.6  (3.20V/cell × 3S)
  *
- * Averaging:
- *   SAMPLE_COUNT samples are taken with SAMPLE_DELAY_US between them.
- *   The min and max are discarded, the rest are averaged. This rejects
- *   ADC glitches and gives a stable reading.
+ * Hardware flags:
+ *   --cells N       set cell count (2–6); scales all default thresholds
+ *   --divider R     override resistor divider ratio (default 7.8)
+ *   --channel N     override ADC channel (default 1)
  *
- * Grace window:
- *   For GRACE_PERIOD_S seconds after first boot, critical voltage is
- *   logged but does NOT trigger shutdown. This lets you SSH in and
- *   disable the service when running off a 5V bench supply.
- *   Grace state is tracked via GRACE_STAMP_FILE (cleared on reboot
- *   because it lives in /run).
+ * Timing flags:
+ *   --interval S    watch loop interval in seconds (default 60)
+ *
+ * Safety flags:
+ *   --shutdown      enable graceful shutdown at critical threshold (default: OFF)
+ *
+ * Examples:
+ *   batt_monitor --check
+ *   batt_monitor --watch --shutdown
+ *   batt_monitor --watch --interval 30 --warning 10.8 --critical 9.9
+ *   batt_monitor --cells 4 --watch --shutdown
+ *   batt_monitor --print
  */
 
 #include <stdio.h>
@@ -33,32 +41,33 @@
 #include <time.h>
 #include <robotcontrol.h>
 
-/* ── Divider: R_bottom / (R_top + R_bottom) ────────────────────────── */
-#define R_TOP           68000.0f
-#define R_BOT           10000.0f
-#define DIVIDER_RATIO   ((R_TOP + R_BOT) / R_BOT)   /* = 7.8 */
+/* ── defaults ────────────────────────────────────────────────────────── */
+#define DEFAULT_R_TOP          68000.0f
+#define DEFAULT_R_BOT          10000.0f
+#define DEFAULT_DIVIDER_RATIO  ((DEFAULT_R_TOP + DEFAULT_R_BOT) / DEFAULT_R_BOT)  /* 7.8 */
+#define DEFAULT_ADC_CHANNEL    1
+#define DEFAULT_WATCH_INTERVAL 60
 
-#define ADC_CHANNEL     1       /* AIN1 on the JST-SH ADC connector    */
+/* Per-cell thresholds (volts) — scaled by cell count */
+#define VCELL_WARNING   3.50f
+#define VCELL_LOW       3.30f
+#define VCELL_CRITICAL  3.20f
+#define DEFAULT_CELLS   3
 
-#define VBAT_WARNING    10.5f   /* 3.50V/cell — log warning            */
-#define VBAT_CRITICAL    9.6f   /* 3.20V/cell — shutdown               */
+#define LOG_FILE  "/var/log/batt_monitor.log"
 
-/* ── Averaging ───────────────────────────────────────────────────────── */
-#define SAMPLE_COUNT    32      /* total samples per read               */
-#define SAMPLE_DELAY_US 2000    /* 2 ms between samples → ~64 ms total  */
-/* min and max are always discarded; need at least 3 samples */
-#if SAMPLE_COUNT < 3
-#error SAMPLE_COUNT must be at least 3
-#endif
+/* ── config struct ───────────────────────────────────────────────────── */
+typedef struct {
+    float divider;
+    int   channel;
+    int   interval_s;
+    float v_warning;
+    float v_low;
+    float v_critical;
+    int   shutdown_enabled;  /* 0 = warn only (default), 1 = shutdown at critical */
+} Config;
 
-/* ── Grace window ────────────────────────────────────────────────────── */
-#define GRACE_PERIOD_S  180     /* 3 minutes after boot before shutdown  */
-#define GRACE_STAMP_FILE "/run/batt_grace_start"   /* cleared on reboot */
-
-/* ── Misc ────────────────────────────────────────────────────────────── */
-#define WATCH_INTERVAL_S 60
-#define LOG_FILE         "/var/log/batt_monitor.log"
-
+static Config cfg;
 
 /* ── helpers ─────────────────────────────────────────────────────────── */
 
@@ -66,7 +75,8 @@ static void write_status(float vbat, const char *status)
 {
     FILE *f = fopen("/run/batt_status.json", "w");
     if (!f) return;
-    fprintf(f, "{\"voltage\":%.3f,\"status\":\"%s\"}\n", vbat, status);
+    fprintf(f, "{\"voltage\":%.3f,\"status\":\"%s\",\"shutdown_enabled\":%d}\n",
+            vbat, status, cfg.shutdown_enabled);
     fclose(f);
 }
 
@@ -77,78 +87,41 @@ static void log_msg(const char *level, float vbat)
     char ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
 
-    fprintf(stderr, "[batt_monitor] %s  %s  %.2fV\n", ts, level, vbat);
+    fprintf(stderr, "[batt_monitor] %s  %-30s  %.2fV\n", ts, level, vbat);
 
     FILE *f = fopen(LOG_FILE, "a");
     if (f) {
-        fprintf(f, "%s  %s  %.2fV\n", ts, level, vbat);
+        fprintf(f, "%s  %-30s  %.2fV\n", ts, level, vbat);
         fclose(f);
     }
 }
 
-/* Write a timestamp file the first time we run this boot. */
-static void grace_stamp_init(void)
-{
-    FILE *f = fopen(GRACE_STAMP_FILE, "wx");   /* x = fail if exists */
-    if (!f) return;   /* already stamped this boot */
-    fprintf(f, "%ld\n", (long)time(NULL));
-    fclose(f);
-}
-
-/* Returns 1 if we are still inside the grace window, 0 if expired. */
-static int grace_active(void)
-{
-    FILE *f = fopen(GRACE_STAMP_FILE, "r");
-    if (!f) return 0;   /* no stamp — should not happen, but don't block */
-
-    long stamp = 0;
-    fscanf(f, "%ld", &stamp);
-    fclose(f);
-
-    long elapsed = (long)time(NULL) - stamp;
-    return (elapsed < GRACE_PERIOD_S);
-}
-
-/* Compare function for qsort float array. */
-static int cmp_float(const void *a, const void *b)
-{
-    float fa = *(const float *)a;
-    float fb = *(const float *)b;
-    return (fa > fb) - (fa < fb);
-}
-
-/* Take SAMPLE_COUNT ADC reads, discard min+max, return average.
- * Returns -1.0f on ADC error. */
 static float read_vbat(void)
 {
-    float samples[SAMPLE_COUNT];
-    int valid = 0;
-
-    for (int i = 0; i < SAMPLE_COUNT; i++) {
-        float v = rc_adc_read_volt(ADC_CHANNEL);
-        if (v < 0.0f) {
-            fprintf(stderr, "[batt_monitor] WARNING: ADC read %d failed, skipping\n", i);
-            continue;
-        }
-        samples[valid++] = v;
-        if (i < SAMPLE_COUNT - 1)
-            usleep(SAMPLE_DELAY_US);
-    }
-
-    if (valid < 3) {
-        fprintf(stderr, "[batt_monitor] ERROR: only %d valid ADC samples\n", valid);
+    float vadc = rc_adc_read_volt(cfg.channel);
+    if (vadc < 0.0f) {
+        fprintf(stderr, "[batt_monitor] ERROR: rc_adc_read_volt(%d) failed\n", cfg.channel);
         return -1.0f;
     }
+    return vadc * cfg.divider;
+}
 
-    qsort(samples, valid, sizeof(float), cmp_float);
-
-    /* Discard lowest and highest sample. */
-    float sum = 0.0f;
-    for (int i = 1; i < valid - 1; i++)
-        sum += samples[i];
-
-    float vadc_avg = sum / (float)(valid - 2);
-    return vadc_avg * DIVIDER_RATIO;
+static const char *classify(float vbat, const char **log_label)
+{
+    if (vbat <= cfg.v_critical) {
+        if (log_label) *log_label = "CRITICAL";
+        return "critical";
+    }
+    if (vbat <= cfg.v_low) {
+        if (log_label) *log_label = "LOW     ";
+        return "low";
+    }
+    if (vbat <= cfg.v_warning) {
+        if (log_label) *log_label = "WARNING ";
+        return "warning";
+    }
+    if (log_label) *log_label = "OK      ";
+    return "ok";
 }
 
 static void do_shutdown(float vbat)
@@ -159,72 +132,113 @@ static void do_shutdown(float vbat)
     system("shutdown -h now 'Battery critical'");
 }
 
-/* Shared logic: decide what to do given a fresh vbat reading.
- * Returns 1 if shutdown was triggered, 0 otherwise. */
-static int evaluate_voltage(float vbat, const char *context)
-{
-    if (vbat < 0.0f) return 0;   /* ADC error — don't block */
-
-    if (vbat <= VBAT_CRITICAL) {
-        if (grace_active()) {
-            /* Still in grace window — warn loudly but don't shut down. */
-            char msg[64];
-            snprintf(msg, sizeof(msg), "CRITICAL (grace window) [%s]", context);
-            write_status(vbat, "critical-grace");
-            log_msg(msg, vbat);
-            fprintf(stderr, "[batt_monitor] Shutdown suppressed — grace window active. "
-                            "Disable batt_check.service if on 5V supply.\n");
-            return 0;
-        }
-        write_status(vbat, "critical");
-        char msg[64];
-        snprintf(msg, sizeof(msg), "CRITICAL [%s]", context);
-        log_msg(msg, vbat);
-        do_shutdown(vbat);
-        return 1;
-    }
-
-    if (vbat <= VBAT_WARNING) {
-        write_status(vbat, "warning");
-        char msg[64];
-        snprintf(msg, sizeof(msg), "WARNING  [%s]", context);
-        log_msg(msg, vbat);
-    } else {
-        write_status(vbat, "ok");
-        char msg[64];
-        snprintf(msg, sizeof(msg), "OK       [%s]", context);
-        log_msg(msg, vbat);
-    }
-    return 0;
-}
-
 /* ── modes ───────────────────────────────────────────────────────────── */
 
 static int mode_check(void)
 {
-    grace_stamp_init();   /* record boot time on first run */
-
     float vbat = read_vbat();
-    return evaluate_voltage(vbat, "boot check");
+    if (vbat < 0.0f) {
+        fprintf(stderr, "[batt_monitor] ADC error — skipping\n");
+        return 0;
+    }
+
+    const char *log_label;
+    const char *status = classify(vbat, &log_label);
+    write_status(vbat, status);
+    log_msg(log_label, vbat);
+
+    if (cfg.shutdown_enabled && vbat <= cfg.v_critical)
+        do_shutdown(vbat);
+
+    return 0;  /* always 0 — don't let systemd abort boot */
 }
 
 static void mode_watch(void)
 {
-    /* Grace stamp should already exist from --check, but stamp anyway
-     * in case watch runs standalone. */
-    grace_stamp_init();
-
+    /* initial reading at start */
     float vbat0 = read_vbat();
-    evaluate_voltage(vbat0, "watch start");
+    if (vbat0 >= 0.0f) {
+        const char *log_label;
+        const char *status = classify(vbat0, &log_label);
+        write_status(vbat0, status);
+        log_msg(log_label, vbat0);
+        if (cfg.shutdown_enabled && vbat0 <= cfg.v_critical) {
+            do_shutdown(vbat0);
+            return;
+        }
+    }
 
     while (1) {
-        sleep(WATCH_INTERVAL_S);
+        sleep(cfg.interval_s);
 
         float vbat = read_vbat();
-        if (vbat < 0.0f) continue;   /* transient ADC error, keep going */
+        if (vbat < 0.0f) continue;  /* transient ADC error, keep going */
 
-        if (evaluate_voltage(vbat, "watch")) return;   /* shutdown triggered */
+        const char *log_label;
+        const char *status = classify(vbat, &log_label);
+        write_status(vbat, status);
+        log_msg(log_label, vbat);
+
+        if (cfg.shutdown_enabled && vbat <= cfg.v_critical) {
+            do_shutdown(vbat);
+            return;
+        }
     }
+}
+
+/* Print a single voltage reading to stdout, no decoration — for scripts */
+static void mode_print(void)
+{
+    float vbat = read_vbat();
+    if (vbat < 0.0f)
+        fprintf(stdout, "error\n");
+    else
+        fprintf(stdout, "%.3f\n", vbat);
+}
+
+/* ── arg parsing ─────────────────────────────────────────────────────── */
+
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+        "Usage: %s MODE [OPTIONS]\n"
+        "\n"
+        "Modes:\n"
+        "  --check          Single shot voltage check, log result\n"
+        "  --watch          Continuous watch loop\n"
+        "  --print          Print voltage to stdout and exit\n"
+        "\n"
+        "Threshold options (volts):\n"
+        "  --warning  V     Warning threshold  (default %.2fV)\n"
+        "  --low      V     Low threshold      (default %.2fV)\n"
+        "  --critical V     Critical threshold (default %.2fV)\n"
+        "  --cells    N     Cell count: scales all default thresholds (default %d)\n"
+        "\n"
+        "Hardware options:\n"
+        "  --divider  R     ADC voltage divider ratio (default %.1f)\n"
+        "  --channel  N     ADC channel number (default %d)\n"
+        "\n"
+        "Timing options:\n"
+        "  --interval S     Watch loop interval in seconds (default %d)\n"
+        "\n"
+        "Safety options:\n"
+        "  --shutdown       Enable graceful shutdown at critical voltage (default: OFF)\n"
+        "\n"
+        "Examples:\n"
+        "  %s --check\n"
+        "  %s --watch --shutdown\n"
+        "  %s --watch --interval 30 --warning 10.8 --critical 9.9\n"
+        "  %s --cells 4 --watch --shutdown\n"
+        "  %s --print\n",
+        prog,
+        VCELL_WARNING  * DEFAULT_CELLS,
+        VCELL_LOW      * DEFAULT_CELLS,
+        VCELL_CRITICAL * DEFAULT_CELLS,
+        DEFAULT_CELLS,
+        DEFAULT_DIVIDER_RATIO,
+        DEFAULT_ADC_CHANNEL,
+        DEFAULT_WATCH_INTERVAL,
+        prog, prog, prog, prog, prog);
 }
 
 /* ── main ─────────────────────────────────────────────────────────────── */
@@ -232,23 +246,102 @@ static void mode_watch(void)
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s --check | --watch\n", argv[0]);
+        usage(argv[0]);
         return 2;
+    }
+
+    /* defaults */
+    int cells = DEFAULT_CELLS;
+    cfg.divider          = DEFAULT_DIVIDER_RATIO;
+    cfg.channel          = DEFAULT_ADC_CHANNEL;
+    cfg.interval_s       = DEFAULT_WATCH_INTERVAL;
+    cfg.v_warning        = VCELL_WARNING  * cells;
+    cfg.v_low            = VCELL_LOW      * cells;
+    cfg.v_critical       = VCELL_CRITICAL * cells;
+    cfg.shutdown_enabled = 0;
+
+    /* track explicit overrides so --cells doesn't clobber them */
+    int warning_set  = 0;
+    int low_set      = 0;
+    int critical_set = 0;
+
+    enum { MODE_NONE, MODE_CHECK, MODE_WATCH, MODE_PRINT } mode = MODE_NONE;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--check") == 0) {
+            mode = MODE_CHECK;
+        } else if (strcmp(argv[i], "--watch") == 0) {
+            mode = MODE_WATCH;
+        } else if (strcmp(argv[i], "--print") == 0) {
+            mode = MODE_PRINT;
+        } else if (strcmp(argv[i], "--shutdown") == 0) {
+            cfg.shutdown_enabled = 1;
+        } else if (strcmp(argv[i], "--cells") == 0 && i + 1 < argc) {
+            cells = atoi(argv[++i]);
+            if (cells < 1 || cells > 8) {
+                fprintf(stderr, "Error: --cells must be 1–8\n");
+                return 2;
+            }
+            /* recalculate defaults, but don't clobber explicit overrides */
+            if (!warning_set)  cfg.v_warning  = VCELL_WARNING  * cells;
+            if (!low_set)      cfg.v_low      = VCELL_LOW      * cells;
+            if (!critical_set) cfg.v_critical = VCELL_CRITICAL * cells;
+        } else if (strcmp(argv[i], "--warning") == 0 && i + 1 < argc) {
+            cfg.v_warning = atof(argv[++i]);
+            warning_set = 1;
+        } else if (strcmp(argv[i], "--low") == 0 && i + 1 < argc) {
+            cfg.v_low = atof(argv[++i]);
+            low_set = 1;
+        } else if (strcmp(argv[i], "--critical") == 0 && i + 1 < argc) {
+            cfg.v_critical = atof(argv[++i]);
+            critical_set = 1;
+        } else if (strcmp(argv[i], "--divider") == 0 && i + 1 < argc) {
+            cfg.divider = atof(argv[++i]);
+            if (cfg.divider <= 0.0f) {
+                fprintf(stderr, "Error: --divider must be > 0\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--channel") == 0 && i + 1 < argc) {
+            cfg.channel = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--interval") == 0 && i + 1 < argc) {
+            cfg.interval_s = atoi(argv[++i]);
+            if (cfg.interval_s < 1) {
+                fprintf(stderr, "Error: --interval must be >= 1\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            usage(argv[0]);
+            return 0;
+        } else {
+            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+            usage(argv[0]);
+            return 2;
+        }
+    }
+
+    if (mode == MODE_NONE) {
+        fprintf(stderr, "Error: no mode specified (--check, --watch, or --print)\n");
+        usage(argv[0]);
+        return 2;
+    }
+
+    /* sanity check threshold ordering */
+    if (cfg.v_critical > cfg.v_low || cfg.v_low > cfg.v_warning) {
+        fprintf(stderr, "[batt_monitor] Warning: thresholds out of order "
+                        "(expected critical < low < warning)\n");
     }
 
     if (rc_adc_init() < 0) {
         fprintf(stderr, "[batt_monitor] rc_adc_init() failed\n");
-        return 0;   /* don't block boot if ADC init fails */
+        return 0;  /* don't block boot */
     }
 
     int ret = 0;
-    if (strcmp(argv[1], "--check") == 0) {
-        ret = mode_check();
-    } else if (strcmp(argv[1], "--watch") == 0) {
-        mode_watch();
-    } else {
-        fprintf(stderr, "Unknown mode: %s\n", argv[1]);
-        ret = 2;
+    switch (mode) {
+        case MODE_CHECK: ret = mode_check(); break;
+        case MODE_WATCH: mode_watch();       break;
+        case MODE_PRINT: mode_print();       break;
+        default: break;
     }
 
     rc_adc_cleanup();
