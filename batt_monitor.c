@@ -1,3 +1,28 @@
+// Copyright (c) 2025 Ryan Lush <ryan.lush@gmail.com>
+//
+// Free for personal, educational, and open-source use.
+// Commercial use requires written permission from the author.
+// Contact: ryan.lush@gmail.com
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025 Ryan Lush <ryan.lush@gmail.com>
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
 /**
  * batt_monitor.c
  *
@@ -59,15 +84,12 @@
 /* ── config struct ───────────────────────────────────────────────────── */
 typedef struct {
     float divider;
-    float r1;                /* top resistor ohms — informational, used to compute divider */
-    float r2;                /* bottom resistor ohms */
-    float trim;              /* multiplicative calibration factor (1.0 = no correction) */
     int   channel;
     int   interval_s;
     float v_warning;
     float v_low;
     float v_critical;
-    int   shutdown_enabled;
+    int   shutdown_enabled;  /* 0 = warn only (default), 1 = shutdown at critical */
 } Config;
 
 static Config cfg;
@@ -78,12 +100,8 @@ static void write_status(float vbat, const char *status)
 {
     FILE *f = fopen("/run/batt_status.json", "w");
     if (!f) return;
-    fprintf(f, "{\"voltage\":%.3f,\"status\":\"%s\","
-               "\"r1\":%.0f,\"r2\":%.0f,\"trim\":%.6f,"
-               "\"shutdown_enabled\":%d}\n",
-            vbat, status,
-            cfg.r1, cfg.r2, cfg.trim,
-            cfg.shutdown_enabled);
+    fprintf(f, "{\"voltage\":%.3f,\"status\":\"%s\",\"shutdown_enabled\":%d}\n",
+            vbat, status, cfg.shutdown_enabled);
     fclose(f);
 }
 
@@ -110,7 +128,7 @@ static float read_vbat(void)
         fprintf(stderr, "[batt_monitor] ERROR: rc_adc_read_volt(%d) failed\n", cfg.channel);
         return -1.0f;
     }
-    return vadc * cfg.divider * cfg.trim;
+    return vadc * cfg.divider;
 }
 
 static const char *classify(float vbat, const char **log_label)
@@ -223,9 +241,6 @@ static void usage(const char *prog)
         "\n"
         "Hardware options:\n"
         "  --divider  R     ADC voltage divider ratio (default %.1f)\n"
-        "  --r1       R     Top resistor in ohms (default %.0f); recomputes divider\n"
-        "  --r2       R     Bottom resistor in ohms (default %.0f); recomputes divider\n"
-        "  --trim     F     Calibration scale factor (default 1.0, e.g. 1.02 for +2%%)\n"
         "  --channel  N     ADC channel number (default %d)\n"
         "\n"
         "Timing options:\n"
@@ -246,8 +261,6 @@ static void usage(const char *prog)
         VCELL_CRITICAL * DEFAULT_CELLS,
         DEFAULT_CELLS,
         DEFAULT_DIVIDER_RATIO,
-        DEFAULT_R_TOP,
-        DEFAULT_R_BOT,
         DEFAULT_ADC_CHANNEL,
         DEFAULT_WATCH_INTERVAL,
         prog, prog, prog, prog, prog);
@@ -264,10 +277,7 @@ int main(int argc, char *argv[])
 
     /* defaults */
     int cells = DEFAULT_CELLS;
-    cfg.r1               = DEFAULT_R_TOP;
-    cfg.r2               = DEFAULT_R_BOT;
     cfg.divider          = DEFAULT_DIVIDER_RATIO;
-    cfg.trim             = 1.0f;
     cfg.channel          = DEFAULT_ADC_CHANNEL;
     cfg.interval_s       = DEFAULT_WATCH_INTERVAL;
     cfg.v_warning        = VCELL_WARNING  * cells;
@@ -314,26 +324,6 @@ int main(int argc, char *argv[])
             cfg.divider = atof(argv[++i]);
             if (cfg.divider <= 0.0f) {
                 fprintf(stderr, "Error: --divider must be > 0\n");
-                return 2;
-            }
-        } else if (strcmp(argv[i], "--r1") == 0 && i + 1 < argc) {
-            cfg.r1 = atof(argv[++i]);
-            if (cfg.r1 <= 0.0f) {
-                fprintf(stderr, "Error: --r1 must be > 0\n");
-                return 2;
-            }
-            cfg.divider = (cfg.r1 + cfg.r2) / cfg.r2;
-        } else if (strcmp(argv[i], "--r2") == 0 && i + 1 < argc) {
-            cfg.r2 = atof(argv[++i]);
-            if (cfg.r2 <= 0.0f) {
-                fprintf(stderr, "Error: --r2 must be > 0\n");
-                return 2;
-            }
-            cfg.divider = (cfg.r1 + cfg.r2) / cfg.r2;
-        } else if (strcmp(argv[i], "--trim") == 0 && i + 1 < argc) {
-            cfg.trim = atof(argv[++i]);
-            if (cfg.trim <= 0.0f) {
-                fprintf(stderr, "Error: --trim must be > 0\n");
                 return 2;
             }
         } else if (strcmp(argv[i], "--channel") == 0 && i + 1 < argc) {

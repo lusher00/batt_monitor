@@ -5,7 +5,7 @@ Wants=local-fs.target
 
 [Service]
 Type=simple
-ExecStart=ExecStart=/usr/local/bin/batt_monitor --watch --r1 68000 --r2 10000 --trim 1.063
+ExecStart=/usr/local/bin/batt_monitor --watch
 Restart=on-failure
 RestartSec=10
 StandardError=journal
