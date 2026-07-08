@@ -89,7 +89,7 @@ static void rc_adc_cleanup(void) {}
 #define DEFAULT_R_TOP          68000.0f
 #define DEFAULT_R_BOT          10000.0f
 #define DEFAULT_DIVIDER_RATIO  ((DEFAULT_R_TOP + DEFAULT_R_BOT) / DEFAULT_R_BOT)  /* 7.8 */
-#define DEFAULT_ADC_CHANNEL    1
+#define DEFAULT_ADC_CHANNEL    0
 #define DEFAULT_WATCH_INTERVAL 60
 
 /* Per-cell thresholds (volts) — scaled by cell count */
