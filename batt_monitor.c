@@ -64,7 +64,26 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
-#include <robotcontrol.h>
+#include <fcntl.h>
+/* ADC via sysfs IIO — no librobotcontrol needed */
+/* BBB Blue: /sys/bus/iio/devices/iio:device0/in_voltageN_raw, ref=1.8V, 12-bit */
+#define ADC_IIO_PATH   "/sys/bus/iio/devices/iio:device0"
+#define ADC_REF_V      1.8f
+#define ADC_MAX_RAW    4096.0f
+
+static float rc_adc_read_volt(int channel)
+{
+    char path[128];
+    snprintf(path, sizeof(path), "%s/in_voltage%d_raw", ADC_IIO_PATH, channel);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1.0f;
+    int raw = 0;
+    fscanf(f, "%d", &raw);
+    fclose(f);
+    return (raw / ADC_MAX_RAW) * ADC_REF_V;
+}
+static int  rc_adc_init(void)    { return 0; }
+static void rc_adc_cleanup(void) {}
 
 /* ── defaults ────────────────────────────────────────────────────────── */
 #define DEFAULT_R_TOP          68000.0f
