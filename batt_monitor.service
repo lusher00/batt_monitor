@@ -5,7 +5,9 @@ Wants=local-fs.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/batt_monitor --watch
+Environment="BATT_MONITOR_ARGS=--watch --shutdown --interval 10 --confirm-samples 3 --trend-hours 2 --trend-drop 0.30 --shutdown-grace 15"
+EnvironmentFile=-/etc/default/batt_monitor
+ExecStart=/usr/local/bin/batt_monitor $BATT_MONITOR_ARGS
 Restart=on-failure
 RestartSec=10
 StandardError=journal
