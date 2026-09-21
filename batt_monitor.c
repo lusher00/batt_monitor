@@ -78,7 +78,10 @@ static float rc_adc_read_volt(int channel)
     FILE *f = fopen(path, "r");
     if (!f) return -1.0f;
     int raw = 0;
-    fscanf(f, "%d", &raw);
+    if (fscanf(f, "%d", &raw) != 1) {
+        fclose(f);
+        return -1.0f;
+    }
     fclose(f);
     return (raw / ADC_MAX_RAW) * ADC_REF_V;
 }
@@ -92,7 +95,11 @@ static void rc_adc_cleanup(void) {}
 #define DEFAULT_TRIM_FACTOR    1.053f  /* measured correction: ADC reads low vs DMM */
 #define DEFAULT_DIVIDER_RATIO  (DEFAULT_R_RATIO * DEFAULT_TRIM_FACTOR)  /* ~8.54 effective */
 #define DEFAULT_ADC_CHANNEL    0
-#define DEFAULT_WATCH_INTERVAL 60
+#define DEFAULT_WATCH_INTERVAL 10
+#define DEFAULT_CONFIRM_SAMPLES 3
+#define DEFAULT_TREND_SECONDS  7200
+#define DEFAULT_TREND_DROP     0.30f
+#define DEFAULT_SHUTDOWN_GRACE 15
 
 /* Per-cell thresholds (volts) — scaled by cell count */
 #define VCELL_WARNING   3.50f
@@ -110,20 +117,38 @@ typedef struct {
     float v_warning;
     float v_low;
     float v_critical;
-    int   shutdown_enabled;  /* 0 = warn only (default), 1 = shutdown at critical */
+    int   shutdown_enabled;
+    int   confirm_samples;
+    int   trend_seconds;
+    float trend_drop;
+    int   shutdown_grace_s;
 } Config;
 
 static Config cfg;
+static int critical_samples;
+static time_t warning_since;
+static float warning_start_voltage;
+static int shutdown_requested;
+static long long shutdown_event;
 
 /* ── helpers ─────────────────────────────────────────────────────────── */
 
 static void write_status(float vbat, const char *status)
 {
-    FILE *f = fopen("/run/batt_status.json", "w");
+    const char *tmp = "/run/batt_status.json.tmp";
+    FILE *f = fopen(tmp, "w");
     if (!f) return;
-    fprintf(f, "{\"voltage\":%.3f,\"status\":\"%s\",\"shutdown_enabled\":%d}\n",
-            vbat, status, cfg.shutdown_enabled);
-    fclose(f);
+    fprintf(f,
+            "{\"voltage\":%.3f,\"status\":\"%s\","
+            "\"shutdown_enabled\":%d,\"critical_samples\":%d,"
+            "\"shutdown_requested\":%d,\"shutdown_event\":%lld,"
+            "\"updated\":%lld}\n",
+            vbat, status, cfg.shutdown_enabled, critical_samples,
+            shutdown_requested, shutdown_event, (long long)time(NULL));
+    if (fclose(f) == 0)
+        rename(tmp, "/run/batt_status.json");
+    else
+        unlink(tmp);
 }
 
 static void log_msg(const char *level, float vbat)
@@ -170,65 +195,98 @@ static const char *classify(float vbat, const char **log_label)
     return "ok";
 }
 
+static int shutdown_policy(float vbat)
+{
+    time_t now = time(NULL);
+
+    if (vbat <= cfg.v_warning) {
+        if (!warning_since) {
+            warning_since = now;
+            warning_start_voltage = vbat;
+        }
+    } else {
+        warning_since = 0;
+        warning_start_voltage = 0.0f;
+    }
+
+    if (vbat <= cfg.v_critical)
+        critical_samples++;
+    else
+        critical_samples = 0;
+
+    int trend_qualified = warning_since
+        && now - warning_since >= cfg.trend_seconds
+        && warning_start_voltage - vbat >= cfg.trend_drop;
+
+    return cfg.shutdown_enabled
+        && vbat <= cfg.v_critical
+        && (critical_samples >= cfg.confirm_samples || trend_qualified);
+}
+
 static void do_shutdown(float vbat)
 {
-    log_msg("CRITICAL — shutting down", vbat);
+    shutdown_requested = 1;
+    shutdown_event = (long long)time(NULL);
+    write_status(vbat, "critical");
+    log_msg("CRITICAL — shutdown requested", vbat);
     sync();
-    sleep(2);
-    system("shutdown -h now 'Battery critical'");
+    sleep(cfg.shutdown_grace_s);
+    int rc = system("shutdown -h now 'Battery critical'");
+    if (rc != 0)
+        fprintf(stderr, "[batt_monitor] shutdown command failed: %d\n", rc);
 }
 
 /* ── modes ───────────────────────────────────────────────────────────── */
 
 static int mode_check(void)
 {
-    float vbat = read_vbat();
-    if (vbat < 0.0f) {
-        fprintf(stderr, "[batt_monitor] ADC error — skipping\n");
-        return 0;
+    int attempts = cfg.shutdown_enabled ? cfg.confirm_samples : 1;
+    for (int i = 0; i < attempts; i++) {
+        float vbat = read_vbat();
+        if (vbat < 0.0f) {
+            fprintf(stderr, "[batt_monitor] ADC error — skipping\n");
+            return 0;
+        }
+
+        const char *log_label;
+        const char *status = classify(vbat, &log_label);
+        int trigger = shutdown_policy(vbat);
+        write_status(vbat, status);
+        log_msg(log_label, vbat);
+
+        if (trigger) {
+            do_shutdown(vbat);
+            break;
+        }
+        if (vbat > cfg.v_critical)
+            break;
+        if (i + 1 < attempts)
+            sleep(2);
     }
-
-    const char *log_label;
-    const char *status = classify(vbat, &log_label);
-    write_status(vbat, status);
-    log_msg(log_label, vbat);
-
-    if (cfg.shutdown_enabled && vbat <= cfg.v_critical)
-        do_shutdown(vbat);
 
     return 0;  /* always 0 — don't let systemd abort boot */
 }
 
 static void mode_watch(void)
 {
-    /* initial reading at start */
-    float vbat0 = read_vbat();
-    if (vbat0 >= 0.0f) {
-        const char *log_label;
-        const char *status = classify(vbat0, &log_label);
-        write_status(vbat0, status);
-        log_msg(log_label, vbat0);
-        if (cfg.shutdown_enabled && vbat0 <= cfg.v_critical) {
-            do_shutdown(vbat0);
-            return;
-        }
-    }
-
     while (1) {
-        sleep(cfg.interval_s);
-
         float vbat = read_vbat();
-        if (vbat < 0.0f) continue;  /* transient ADC error, keep going */
+        if (vbat < 0.0f) {
+            sleep(cfg.interval_s);
+            continue;
+        }
 
         const char *log_label;
         const char *status = classify(vbat, &log_label);
+        int trigger = shutdown_policy(vbat);
         write_status(vbat, status);
         log_msg(log_label, vbat);
 
-        if (cfg.shutdown_enabled && vbat <= cfg.v_critical) {
+        if (trigger) {
             do_shutdown(vbat);
             return;
         }
+        sleep(cfg.interval_s);
     }
 }
 
@@ -266,6 +324,10 @@ static void usage(const char *prog)
         "\n"
         "Timing options:\n"
         "  --interval S     Watch loop interval in seconds (default %d)\n"
+        "  --confirm-samples N  Critical samples required (default %d)\n"
+        "  --trend-hours H  Warning/low trend duration for fast critical shutdown (default 2)\n"
+        "  --trend-drop V   Minimum drop across trend window (default %.2fV)\n"
+        "  --shutdown-grace S  Seconds for peers to halt before Bone shutdown (default %d)\n"
         "\n"
         "Safety options:\n"
         "  --shutdown       Enable graceful shutdown at critical voltage (default: OFF)\n"
@@ -284,6 +346,9 @@ static void usage(const char *prog)
         DEFAULT_DIVIDER_RATIO,
         DEFAULT_ADC_CHANNEL,
         DEFAULT_WATCH_INTERVAL,
+        DEFAULT_CONFIRM_SAMPLES,
+        DEFAULT_TREND_DROP,
+        DEFAULT_SHUTDOWN_GRACE,
         prog, prog, prog, prog, prog);
 }
 
@@ -305,6 +370,10 @@ int main(int argc, char *argv[])
     cfg.v_low            = VCELL_LOW      * cells;
     cfg.v_critical       = VCELL_CRITICAL * cells;
     cfg.shutdown_enabled = 0;
+    cfg.confirm_samples  = DEFAULT_CONFIRM_SAMPLES;
+    cfg.trend_seconds    = DEFAULT_TREND_SECONDS;
+    cfg.trend_drop       = DEFAULT_TREND_DROP;
+    cfg.shutdown_grace_s = DEFAULT_SHUTDOWN_GRACE;
 
     /* track explicit overrides so --cells doesn't clobber them */
     int warning_set  = 0;
@@ -353,6 +422,31 @@ int main(int argc, char *argv[])
             cfg.interval_s = atoi(argv[++i]);
             if (cfg.interval_s < 1) {
                 fprintf(stderr, "Error: --interval must be >= 1\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--confirm-samples") == 0 && i + 1 < argc) {
+            cfg.confirm_samples = atoi(argv[++i]);
+            if (cfg.confirm_samples < 2) {
+                fprintf(stderr, "Error: --confirm-samples must be >= 2\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--trend-hours") == 0 && i + 1 < argc) {
+            float hours = atof(argv[++i]);
+            if (hours < 0.0f) {
+                fprintf(stderr, "Error: --trend-hours must be >= 0\n");
+                return 2;
+            }
+            cfg.trend_seconds = (int)(hours * 3600.0f);
+        } else if (strcmp(argv[i], "--trend-drop") == 0 && i + 1 < argc) {
+            cfg.trend_drop = atof(argv[++i]);
+            if (cfg.trend_drop < 0.0f) {
+                fprintf(stderr, "Error: --trend-drop must be >= 0\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--shutdown-grace") == 0 && i + 1 < argc) {
+            cfg.shutdown_grace_s = atoi(argv[++i]);
+            if (cfg.shutdown_grace_s < 0) {
+                fprintf(stderr, "Error: --shutdown-grace must be >= 0\n");
                 return 2;
             }
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
