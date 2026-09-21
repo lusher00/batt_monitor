@@ -26,14 +26,17 @@
 /**
  * batt_monitor.c
  *
- * Reads LiPo voltage via a resistor divider on AIN1.
- * Divider: 68k (top) + 10k (bottom) → Vbat/7.8 on AIN1.
+ * Reads pack voltage on the BeagleBone Blue's built-in DC power jack sense,
+ * AIN5 (net B8 on the schematic).
+ * Divider: 47k (top) + 4.7k (bottom) → Vjack/11.0 on AIN5.
  * ADC ref = 1.8V, 12-bit (0–4095).
  *
  * Modes:
  *   --check     single shot, logs voltage + status, exits 0 always
  *   --watch     loop (default 60s), logs warnings
  *   --print     print raw voltage to stdout as "12.34" and exit (scripting)
+ *   --calibrate V   read the ADC against a known input voltage V and print
+ *                   the divider ratio that makes the reading match
  *
  * Threshold flags (volts):
  *   --warning V     default 10.5  (3.50V/cell × 3S)
@@ -42,11 +45,11 @@
  *
  * Hardware flags:
  *   --cells N       set cell count (2–6); scales all default thresholds
- *   --divider R     override resistor divider ratio (default 7.8)
- *   --channel N     override ADC channel (default 1)
+ *   --divider R     override resistor divider ratio (default 11.0)
+ *   --channel N     override ADC channel (default 5)
  *
  * Timing flags:
- *   --interval S    watch loop interval in seconds (default 60)
+ *   --interval S    watch loop interval in seconds (default 10)
  *
  * Safety flags:
  *   --shutdown      enable graceful shutdown at critical threshold (default: OFF)
@@ -57,6 +60,7 @@
  *   batt_monitor --watch --interval 30 --warning 10.8 --critical 9.9
  *   batt_monitor --cells 4 --watch --shutdown
  *   batt_monitor --print
+ *   batt_monitor --channel 5 --calibrate 12.00
  */
 
 #include <stdio.h>
@@ -88,13 +92,15 @@ static float rc_adc_read_volt(int channel)
 static int  rc_adc_init(void)    { return 0; }
 static void rc_adc_cleanup(void) {}
 
-/* ── defaults ────────────────────────────────────────────────────────── */
-#define DEFAULT_R_TOP          68000.0f
-#define DEFAULT_R_BOT          10000.0f
-#define DEFAULT_R_RATIO        ((DEFAULT_R_TOP + DEFAULT_R_BOT) / DEFAULT_R_BOT)  /* 7.8 theoretical */
-#define DEFAULT_TRIM_FACTOR    1.053f  /* measured correction: ADC reads low vs DMM */
-#define DEFAULT_DIVIDER_RATIO  (DEFAULT_R_RATIO * DEFAULT_TRIM_FACTOR)  /* ~8.54 effective */
-#define DEFAULT_ADC_CHANNEL    0
+/* ── fallback defaults ───────────────────────────────────────────────────
+ * These exist only so the program runs with no flags. The installed systemd
+ * units pass every hardware and threshold value explicitly from
+ * /etc/default/batt_monitor, so changing hardware never needs a rebuild.
+ */
+#define DEFAULT_R_TOP          47000.0f
+#define DEFAULT_R_BOT           4700.0f
+#define DEFAULT_DIVIDER_RATIO  ((DEFAULT_R_TOP + DEFAULT_R_BOT) / DEFAULT_R_BOT)  /* 11.0 */
+#define DEFAULT_ADC_CHANNEL    5
 #define DEFAULT_WATCH_INTERVAL 10
 #define DEFAULT_CONFIRM_SAMPLES 3
 #define DEFAULT_TREND_SECONDS  7200
@@ -300,6 +306,34 @@ static void mode_print(void)
         fprintf(stdout, "%.3f\n", vbat);
 }
 
+/* Read a known input voltage and report the divider ratio that matches it.
+ * Use with a bench supply or meter reading on the same node:
+ *   batt_monitor --channel 5 --calibrate 12.00
+ */
+static void mode_calibrate(float v_ref)
+{
+    float vadc = rc_adc_read_volt(cfg.channel);
+    if (vadc < 0.0f) {
+        fprintf(stderr, "[batt_monitor] ERROR: cannot read ADC channel %d\n", cfg.channel);
+        return;
+    }
+    if (vadc < 0.001f) {
+        fprintf(stderr, "[batt_monitor] ERROR: ADC channel %d reads ~0V — "
+                        "wrong channel, or nothing connected\n", cfg.channel);
+        return;
+    }
+
+    float ratio = v_ref / vadc;
+
+    printf("ADC channel      : %d\n", cfg.channel);
+    printf("ADC pin voltage  : %.4f V\n", vadc);
+    printf("Reference input  : %.3f V\n", v_ref);
+    printf("Current divider  : %.4f  -> reports %.3f V  (error %+.3f V)\n",
+           cfg.divider, vadc * cfg.divider, vadc * cfg.divider - v_ref);
+    printf("Corrected divider: %.4f\n", ratio);
+    printf("\nPut this in /etc/default/batt_monitor:  --divider %.4f\n", ratio);
+}
+
 /* ── arg parsing ─────────────────────────────────────────────────────── */
 
 static void usage(const char *prog)
@@ -311,6 +345,7 @@ static void usage(const char *prog)
         "  --check          Single shot voltage check, log result\n"
         "  --watch          Continuous watch loop\n"
         "  --print          Print voltage to stdout and exit\n"
+        "  --calibrate V    Read ADC against known input V, print correct divider\n"
         "\n"
         "Threshold options (volts):\n"
         "  --warning  V     Warning threshold  (default %.2fV)\n"
@@ -337,7 +372,8 @@ static void usage(const char *prog)
         "  %s --watch --shutdown\n"
         "  %s --watch --interval 30 --warning 10.8 --critical 9.9\n"
         "  %s --cells 4 --watch --shutdown\n"
-        "  %s --print\n",
+        "  %s --print\n"
+        "  %s --channel 5 --calibrate 12.00\n",
         prog,
         VCELL_WARNING  * DEFAULT_CELLS,
         VCELL_LOW      * DEFAULT_CELLS,
@@ -349,7 +385,7 @@ static void usage(const char *prog)
         DEFAULT_CONFIRM_SAMPLES,
         DEFAULT_TREND_DROP,
         DEFAULT_SHUTDOWN_GRACE,
-        prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog);
 }
 
 /* ── main ─────────────────────────────────────────────────────────────── */
@@ -380,7 +416,8 @@ int main(int argc, char *argv[])
     int low_set      = 0;
     int critical_set = 0;
 
-    enum { MODE_NONE, MODE_CHECK, MODE_WATCH, MODE_PRINT } mode = MODE_NONE;
+    enum { MODE_NONE, MODE_CHECK, MODE_WATCH, MODE_PRINT, MODE_CAL } mode = MODE_NONE;
+    float cal_ref = 0.0f;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--check") == 0) {
@@ -389,6 +426,13 @@ int main(int argc, char *argv[])
             mode = MODE_WATCH;
         } else if (strcmp(argv[i], "--print") == 0) {
             mode = MODE_PRINT;
+        } else if (strcmp(argv[i], "--calibrate") == 0 && i + 1 < argc) {
+            mode = MODE_CAL;
+            cal_ref = atof(argv[++i]);
+            if (cal_ref <= 0.0f) {
+                fprintf(stderr, "Error: --calibrate needs a positive voltage\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--shutdown") == 0) {
             cfg.shutdown_enabled = 1;
         } else if (strcmp(argv[i], "--cells") == 0 && i + 1 < argc) {
@@ -460,7 +504,8 @@ int main(int argc, char *argv[])
     }
 
     if (mode == MODE_NONE) {
-        fprintf(stderr, "Error: no mode specified (--check, --watch, or --print)\n");
+        fprintf(stderr, "Error: no mode specified "
+                        "(--check, --watch, --print, or --calibrate)\n");
         usage(argv[0]);
         return 2;
     }
@@ -481,6 +526,7 @@ int main(int argc, char *argv[])
         case MODE_CHECK: ret = mode_check(); break;
         case MODE_WATCH: mode_watch();       break;
         case MODE_PRINT: mode_print();       break;
+        case MODE_CAL:   mode_calibrate(cal_ref); break;
         default: break;
     }
 
